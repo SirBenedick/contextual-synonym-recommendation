@@ -1,0 +1,191 @@
+stages:
+  - setup
+  - build
+  - deploy
+  - fetch-feedback
+  - training
+
+fetch-mlflow-model:
+  image: python:3.8-slim-buster
+  stage: setup
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - production.model
+    policy: pull-push
+  script:
+    - pip install mlflow
+    - mv $(python api/fetch_mlflow.py) production.model
+  only:
+    - main
+    - tags
+  except:
+    - schedules
+
+build-react-application:
+  image: node:16.16
+  stage: setup
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - web/my-app/build/
+    policy: pull-push
+  script:
+    - cd web/my-app
+    - npm install
+    - npm run build
+  only:
+    - main
+  except:
+    - schedules
+
+build-api:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - production.model
+    policy: pull-push
+  script:
+    - mkdir -p /kaniko/.docker
+    - mv production.model ${CI_PROJECT_DIR_API}/
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR_API}/"
+      --dockerfile "${CI_PROJECT_DIR_API}/dockerfiles/api.dockerfile"
+      --destination "${CI_REGISTRY_IMAGE_API}:${CI_COMMIT_SHORT_SHA}"
+  only:
+    - main
+    - tags
+  except:
+    - schedules
+
+build-frontend:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - web/my-app/build/
+    policy: pull-push
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR_FRONTEND}/"
+      --dockerfile "${CI_PROJECT_DIR_FRONTEND}/dockerfile"
+      --destination "${CI_REGISTRY_IMAGE_FRONTEND}:${CI_COMMIT_SHORT_SHA}"
+  only:
+    - main
+  except:
+    - schedules
+
+deploy-kubernetes:
+  stage: deploy
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: ['']
+  script:
+    - kubectl config set clusters.k8s.certificate-authority-data $K8S_CERTIFICATE 
+    - kubectl config set clusters.k8s.server $K8S_SERVER 
+    - kubectl config set users.ci-user.token $K8S_TOKEN
+    - kubectl config set-context ci-k8s --cluster=k8s --user=ci-user --namespace=group1
+    - kubectl config use-context ci-k8s
+    - kubectl get pods
+    - kubectl set image deployment/csr-api-deployment csr-api=benedick/csr-api:$CI_COMMIT_SHORT_SHA
+    - kubectl set image deployment/csr-frontend-deployment csr-frontend=benedick/csr-frontend:$CI_COMMIT_SHORT_SHA
+  only:
+    - main
+    - tags
+  except:
+    - schedules
+
+build-fetch-feedback:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR_API}/"
+      --dockerfile "${CI_PROJECT_DIR_API}/dockerfiles/training.dockerfile"
+      --destination "${CI_REGISTRY_IMAGE_TRAINING}:latest"
+  only:
+    - schedules
+
+build-training:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR_API}/"
+      --dockerfile "${CI_PROJECT_DIR_API}/dockerfiles/kubectl-envsubst.dockerfile"
+      --destination "${CI_REGISTRY_IMAGE_KUBECTL_ENVSUBST}:latest"
+  only:
+    - schedules
+
+fetch-feedback:
+  image: benedick/csr-training:latest
+  stage: fetch-feedback
+  script:
+    # prepare git commits/push from CI, see https://stackoverflow.com/a/51466047
+    - mkdir -pvm 0700 ~/.ssh
+    - echo "$SSH_DEPLOY_KEY" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H 'git.URL.de' >> ~/.ssh/known_hosts
+    - git config --global user.email $(git --no-pager show -s --format='%ae' HEAD)
+    - git config --global user.name $(git --no-pager show -s --format='%an' HEAD)
+    - git remote set-url --push origin "git@git.URL.git"
+    - git checkout $CI_COMMIT_REF_NAME
+    - git pull
+    # prepare dvc
+    - dvc remote add -d minio s3://group1 -f --local
+    - dvc remote modify minio endpointurl "$MINIO_ENDPOINT" --local
+    - dvc remote modify minio secret_access_key $MINIO_SECRET_KEY --local
+    - dvc remote modify minio access_key_id $MINIO_ACCESS_KEY --local
+    - dvc pull datasets/feedback.csv
+    # fetch feedback and commit
+    - curl 'http://URL.de/api/feedback/yesterday' | tail -n+2 >> datasets/feedback.csv
+    - dvc add datasets/feedback.csv
+    - git add datasets/feedback.csv.dvc
+    - dvc push
+    - git commit -m "Add feedback from $(date -d 'yesterday 13:00' '+%Y-%m-%d')" || true # don't let the pipeline fail if there are no changes
+    - git push -o ci.skip
+  only:
+    - schedules
+
+training:
+  stage: training
+  image:
+    name: benedick/csr-kubectl-envsubst:latest
+    entrypoint: ['']
+  timeout: 8 hours
+  script:
+    - kubectl config set clusters.k8s.certificate-authority-data $K8S_CERTIFICATE
+    - kubectl config set clusters.k8s.server $K8S_SERVER
+    - kubectl config set users.ci-user.token $K8S_TOKEN
+    - kubectl config set-context ci-k8s --cluster=k8s --user=ci-user --namespace=group1
+    - kubectl config use-context ci-k8s
+    - kubectl get pods
+    - kubectl delete job csr-training || true
+    - SSH_DEPLOY_KEY=$(printf "%s" "$SSH_DEPLOY_KEY" | base64 -w 0)
+    - cat .kube/csr-training.yaml | envsubst | kubectl apply -f -
+    - sleep 120
+    - kubectl logs --follow $(kubectl get pods -l app=csr-training --no-headers | cut -d " " -f 1)
+  only:
+    - schedules

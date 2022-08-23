@@ -1,0 +1,29 @@
+.App {
+  text-align: center;
+}
+
+.Sentence-input {
+  width: 100%;
+  text-align: center;
+  border: none;
+  background-color: transparent;
+  resize: none;
+  outline: none;
+  font-size: 18px;
+  font-style: normal;
+  font-family: inherit;
+}
+
+.App-link {
+  color: #61dafb;
+}
+
+@keyframes App-logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}

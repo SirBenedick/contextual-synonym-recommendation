@@ -1,0 +1,11 @@
+FROM python:3.8-slim-buster
+
+WORKDIR /python-docker
+
+COPY requirements.txt requirements.txt
+RUN pip3 install -r requirements.txt
+
+COPY ./my-app/build ./my-app/build
+COPY app.py app.py
+
+CMD [ "python3", "-m" , "gunicorn", "-w", "4", "app:app", "-b", ":80"]
